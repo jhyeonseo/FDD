@@ -1,0 +1,13 @@
+CUDA_VISIBLE_DEVICES=0,1,2,3 OMP_NUM_THREADS=1 torchrun --nproc_per_node=4 train.py \
+--data_path ../dataset/kitti_dataset \
+--pose_path ../dataset/kitti_dataset_odom/dataset \
+--model_name VIT_POSE_FUSION_MULTISCALE_CLS_PARTITIONHARD_HEAD_OBSERVER_DROP_LINEAR_BASE \
+--depth_input rgb \
+--pose_input fusion \
+--png \
+--batch_size 16 \
+--width 640 \
+--height 192 \
+--no_crop \
+--split eigen_zhou \
+--novel_frame_ids 0 -1 1    
