@@ -46,6 +46,7 @@ import matplotlib.cm as cm
 
 torch.autograd.set_detect_anomaly(True)
 
+
 def init_seeds(seed=0, cuda_deterministic=True):
     random.seed(seed)
     np.random.seed(seed)
@@ -160,7 +161,7 @@ class Trainer:
         self.project_3d = {}
         for scale in self.opt.scales:
             h = self.opt.height // (2 ** scale)
-            w = self.opt.width // (2 ** scale)
+            w = self.opt.width // (2 ** scale) 
 
             self.backproject_depth[scale] = BackprojectDepth(self.opt.batch_size, h, w)
             self.backproject_depth[scale].to(self.device)
@@ -190,13 +191,16 @@ class Trainer:
 
         if self.depth_input == 'fusion':
             self.models["encoder"] = networks.ResnetEncoder(num_layers=18, num_ch_enc=np.array([64, 64, 128, 256, 512]), pretrained=True, num_input_channels=6)
+            #self.models["encoder"] = networks.DEPTHVIT(input_size=(self.opt.height,self.opt.width), num_input_channels=6)
         else:
             self.models["encoder"] = networks.ResnetEncoder(num_layers=18, num_ch_enc= np.array([64, 64, 128, 256, 512]), pretrained=True, num_input_channels=3)
+            #self.models["encoder"] = networks.DEPTHVIT(input_size=(self.opt.height,self.opt.width), num_input_channels=3)
             
         self.models["depth"] = networks.DepthDecoder(num_ch_enc=np.array([64, 64, 128, 256, 512]),
                                                      num_ch_dec=np.array([16, 32, 64, 128, 256]),
                                                      num_layers=len(np.array([16, 32, 64, 128, 256])),
                                                      scales=self.opt.scales)
+                               
 
         if self.use_posenet:
             if self.pose_input == 'fusion':
@@ -205,11 +209,11 @@ class Trainer:
                 #self.models["pose_encoder"] = networks.ResnetEncoder(num_layers=18, pretrained=True, num_input_channels=8)
             elif self.pose_input == 'rgb':
                 self.models["pose_encoder"] = networks.VIT(input_size=(self.opt.height,self.opt.width), num_input_channels=3)
-                self.models["pose"] = networks.PoseDecoder(num_ch_enc=np.array([768]), num_input_features=1, num_frames_to_predict_for=2)
+                self.models["pose"] = networks.PoseDecoder(num_ch_enc=np.array([384]), num_input_features=1, num_frames_to_predict_for=2)
                 #self.models["pose_encoder"] = networks.ResnetEncoder(num_layers=18, num_ch_enc= np.array([64, 64, 128, 256, 512]), pretrained=True, num_input_channels=6)
             elif self.pose_input == 'flow':
                 self.models["pose_encoder"] = networks.VIT(input_size=(self.opt.height,self.opt.width), num_input_channels=3)
-                self.models["pose"] = networks.PoseDecoder(num_ch_enc=np.array([768]), num_input_features=1, num_frames_to_predict_for=2)
+                self.models["pose"] = networks.PoseDecoder(num_ch_enc=np.array([384]), num_input_features=1, num_frames_to_predict_for=2)
                 #self.models["pose_encoder"] = networks.ResnetEncoder(num_layers=18, pretrained=True, num_input_channels=2)
 
         return models
@@ -433,6 +437,20 @@ class Trainer:
             
         return reprojection_loss
     
+    def compute_reprojection_loss_ROI(self, pred, target):                                             # auto-masking ROI
+        '''Computes reprojection loss only at specific region
+        '''
+        abs_diff = torch.abs(target[72:120, 240:400] - pred[72:120, 240:400])
+        l1_loss = abs_diff.mean(1, True)
+
+        if self.opt.use_ssim:
+            ssim_loss = self.ssim(pred[72:120, 240:400], target[72:120, 240:400]).mean(1, True)
+            reprojection_loss = 0.85 * ssim_loss + 0.15 * l1_loss
+        else:
+            reprojection_loss = l1_loss
+            
+        return reprojection_loss
+    
 
     def compute_losses(self, inputs, outputs):
         losses = {}
@@ -460,7 +478,7 @@ class Trainer:
             identity_reprojection_losses = []
             for frame_id in self.opt.novel_frame_ids[1:]:
                 pred = inputs[("color", frame_id, source_scale)]
-                identity_reprojection_losses.append(self.compute_reprojection_loss(pred, target))           
+                identity_reprojection_losses.append(self.compute_reprojection_loss(pred, target))           # 0번째 프레임과 다음 프레임들 사이의 reprojection loss 계산
             
             identity_reprojection_losses = torch.cat(identity_reprojection_losses, 1)
             reprojection_losses = torch.cat(reprojection_losses, 1)
@@ -480,7 +498,7 @@ class Trainer:
                 outputs[("lossmap")] = to_optimise.clone().detach()
 
             mean_disp = disp.mean(2, True).mean(3, True)
-            norm_disp = disp / (mean_disp + 1e-7)
+            norm_disp = disp / (mean_disp + 1e-5)
             smooth_loss = get_smooth_loss(norm_disp, color)
 
             loss += self.opt.disparity_smoothness * smooth_loss / (2 ** scale)
@@ -727,7 +745,7 @@ class Trainer:
 
                     pred_disp, _ = disp_to_depth(outputs[("disp", 0, 0)], self.opt.min_depth, self.opt.max_depth)
                     pred_disp = pred_disp.cpu()[:, 0].numpy()
-                    pred_disps.append(pred_disp)
+                    pred_disps.append(pred_disp)#tolist
 
     
             pred_disps = np.concatenate(pred_disps)
@@ -939,8 +957,8 @@ def preprocess_disp(input_image):
     process_disp = (input_image - input_image.mean()) / input_image.std()
     return process_disp
 
-def create_mask(attn_map, input_shape, scale_factor=1):
-    threshold = (torch.mean(attn_map, dim=(1,2)) - scale_factor * torch.std(attn_map, dim=(1,2))).cuda()
+def create_mask(attn_map, input_shape, scale_factor=2):                                                                   # scale_factor 1 -> 2
+    threshold = (torch.mean(attn_map, dim=(1,2)) - scale_factor * torch.std(attn_map, dim=(1,2))).cuda()                  # threshold 변경?
     mask = []
     for i in range(attn_map.size(0)):
         thresholded_batch = torch.where(attn_map[i] <= threshold[i], torch.tensor(0.0).cuda(), torch.tensor(1.0).cuda())
