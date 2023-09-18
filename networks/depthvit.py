@@ -11,9 +11,9 @@ import math
 import torch.nn.functional as F
 
 
-class VIT(nn.Module):
-    def __init__(self, model_type='vit_base_patch16_384', pretrained=True, num_classes=0, input_size=(192,640), patch_size=[16,16], start_index=1, num_input_channels=7):  # 16patch로 실험 
-        super(VIT, self).__init__()
+class DEPTHVIT(nn.Module):
+    def __init__(self, model_type='vit_base_patch16_384', pretrained=True, num_classes=0, input_size=(192,640), patch_size=[16,16], start_index=1, num_input_channels=6):  # 16patch로 실험 
+        super(DEPTHVIT, self).__init__()
         
         self.patch_size = patch_size
         self.start_index = start_index
@@ -81,10 +81,10 @@ class VIT(nn.Module):
 
         x = self.encoder.norm(x)                                               # [1, 1921, 384]
 
-        return self.make_pose(x)
+        return self.make_depth(x)
         
 
-    def make_pose(self, input):
+    def make_depth(self, input):
         #print(input.shape)                                          # input shape [1, 1921, 384]
         q = input[:,0,:].unsqueeze(1)                                # cls_token 으로 쿼리 
         x = input[:,1:,:]
@@ -102,18 +102,18 @@ class VIT(nn.Module):
         row_chunks = torch.chunk(row_indices, 80)
         masked = torch.zeros(attn.shape).cuda()
         
-        if self.training:                                                              # training시에만 partition
-            for idx in row_chunks:
+        if self.drop:                                                              # training시에만 partition
+            for idx in chunks:
                 part = attn[:,:,idx].clone()
                 part = part.softmax(dim=-1)                                        # B, 1, num_indices
                 median = torch.median(part, dim=-1)[0].unsqueeze(-1).cuda()        # B, 1, 1   # softmax값들의 median  median말고 더 낮은 수 고려      
-                mask_index = (part > median).cuda()                                # B, 1, num_indices part > median -> part < median 고려
+                mask_index = (part < median).cuda()                                # B, 1, num_indices part > median -> part < median 고려
                 attn[:,:,idx] = part
                 mask = part.clone()
                 mask[mask_index] *= 0
                 masked[:,:,idx] = mask
-        else:
-            attn /= torch.max(attn)
+        '''else:
+            attn = attn.softmax(dim=-1)'''
             
         masked /= (num_indices/2)    ## ??
         
@@ -127,7 +127,7 @@ class VIT(nn.Module):
         x = self.proj(x)
         x = self.encoder.norm(x)
         
-        
+        print(x.shape)                                                           # depth decoder용 
         
         return x, (attn.reshape(B,self.h//self.patch_size[1], self.w//self.patch_size[0]), masked.reshape(B,self.h//self.patch_size[1], self.w//self.patch_size[0]))  #pose_inputs, attn_map, masked_attn_map
         
@@ -158,65 +158,3 @@ class VIT(nn.Module):
             return new
         else:
             return output
-            
-
-    def rollout(self, input_shape):
-        result_min = torch.eye(self.attentions[0].size(-1)).cuda()
-        masked_result_min = torch.eye(self.attentions[0].size(-1)).cuda()
-        for attention in self.attentions:
-            attention_heads_fused = attention.min(axis=1)[0]
-            I = torch.eye(attention_heads_fused.size(-1)).cuda()
-            a = (attention_heads_fused + 1.0*I)/2
-            a = a / a.sum(dim=-1)[:, None, :]
-            result_min = torch.matmul(a, result_min)
-        mask_min = result_min[:, 0 , 1 :]
-        mask_min = mask_min.reshape(-1, input_shape[0], input_shape[1])
-        mask_min = mask_min / mask_min.max()    
-        
-        for attention in self.masked_attentions:
-            attention_heads_fused = attention.min(axis=1)[0]
-            I = torch.eye(attention_heads_fused.size(-1)).cuda()
-            a = (attention_heads_fused + 1.0*I)/2
-            a = a / a.sum(dim=-1)[:, None, :]
-            masked_result_min = torch.matmul(a, masked_result_min)
-        masked_mask_min = masked_result_min[:, 0 , 1 :]
-        masked_mask_min = masked_mask_min.reshape(-1, input_shape[0], input_shape[1])
-        masked_mask_min = masked_mask_min / masked_mask_min.max() 
-        
-        '''
-        result_mean = torch.eye(self.attentions[0].size(-1)).cuda()
-        masked_result_mean = torch.eye(self.attentions[0].size(-1)).cuda()
-        for attention in self.attentions:
-            attention_heads_fused = attention.mean(axis=1)
-            I = torch.eye(attention_heads_fused.size(-1)).cuda()
-            a = (attention_heads_fused + 1.0*I)/2
-            a = a / a.sum(dim=-1)[:, None, :]
-            result_mean = torch.matmul(a, result_mean)
-        mask_mean = result_mean[:, 0 , 1 :]                                                            # B, 480
-        mask_mean = mask_mean.reshape(-1, input_shape[0], input_shape[1])                              # B, 12, 40
-        mask_mean = mask_mean / mask_mean.max()
-        
-        
-                                                                                                       # B, 481, 481
-        correlation = result_mean[:, 1:, 0].clone().detach()                                           # B, 480
-        correlation = correlation.reshape(-1, input_shape[0], input_shape[1])                          # B, 12, 40
-        entropy = result_mean[:, 1: , 1: ].clone().detach()                                            # B, 480, 480
-        ratio = entropy.sum(dim=-1).unsqueeze(1)                                                       # B, 1, 480
-        entropy = entropy / ratio                                                                      # B, 480, 480
-        entropy = entropy.reshape(-1, input_shape[0], input_shape[1], input_shape[0], input_shape[1])  # B, 12, 40, 12, 40 
-        
-        
-        for attention in self.masked_attentions:
-            attention_heads_fused = attention.mean(axis=1)
-            I = torch.eye(attention_heads_fused.size(-1)).cuda()
-            a = (attention_heads_fused + 1.0*I)/2
-            a = a / a.sum(dim=-1)[:, None, :]
-            masked_result_mean = torch.matmul(a, masked_result_mean)
-        masked_mask_mean = masked_result_mean[:, 0 , 1 :]
-        masked_mask_mean = masked_mask_mean.reshape(-1, input_shape[0], input_shape[1])
-        masked_mask_mean = masked_mask_mean / masked_mask_mean.max() 
-        '''
-        
-
-        return mask_min.detach(), masked_mask_min.detach()#, mask_mean.detach(), masked_mask_mean.detach(), correlation.detach(), entropy.detach()
-

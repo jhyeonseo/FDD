@@ -4,3 +4,4 @@ from .pose import PoseDecoder
 from .resnet_encoder import ResnetEncoder
 from .FFD import FFD
 from .vit import VIT
+from .depthvit import DEPTHVIT
