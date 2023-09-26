@@ -8,4 +8,5 @@ models
 results
 pretrained
 samples
+train.sh
 networks/ffd_utils/104checkpoint.pth

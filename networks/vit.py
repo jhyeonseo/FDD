@@ -12,7 +12,7 @@ import torch.nn.functional as F
 
 
 class VIT(nn.Module):
-    def __init__(self, model_type='vit_base_patch16_384', pretrained=True, num_classes=0, input_size=(192,640), patch_size=[16,16], start_index=1, num_input_channels=7):  # 16patch로 실험 
+    def __init__(self, model_type='vit_small_patch16_384', pretrained=True, num_classes=0, input_size=(192,640), patch_size=[16,16], start_index=1, num_input_channels=7):  # 16patch로 실험 
         super(VIT, self).__init__()
         
         self.patch_size = patch_size
@@ -36,7 +36,7 @@ class VIT(nn.Module):
         encoder.patch_embed.proj = nn.Conv2d(6, encoder.patch_embed.proj.out_channels, (patch_size[1], patch_size[0]), stride=(patch_size[1], patch_size[0]))
         encoder.patch_embed.proj.weight = weight
         
-        self.dim = 768                                                # small model 384
+        self.dim = 384                                                # small model 384
 
         self.encoder = encoder
         self.to_kv = nn.Linear(self.dim, self.dim * 2, bias = False)
@@ -61,7 +61,7 @@ class VIT(nn.Module):
         else:
             self.drop = False
 
-        x = self.encoder.patch_embed.proj(input).flatten(2).transpose(1, 2)     # 이미지를 패치 단위로 쪼개고 D 차원으로 projection 수행 -> 모든 패치를 1차원으로 flatten 한 후 (B,P,D) shape로 변경 # [1, 1920, 384]
+        x = self.encoder.patch_embed.proj(input).flatten(2).transpose(1, 2)     # 이미지를 패치 단위로 쪼개고 D 차원으로 projection 수행 -> 모든 패치를 1차원으로 flatten 한 후 (B,P,D) shape로 변경 # [1, 1920, 384] [3, 480, 784]
         
         #print(x.shape)
         
@@ -82,10 +82,10 @@ class VIT(nn.Module):
         x = self.encoder.norm(x)                                               # [1, 1921, 384]
 
         return self.make_pose(x)
-        
+    
 
     def make_pose(self, input):
-        #print(input.shape)                                          # input shape [1, 1921, 384]
+        #print(input.shape)                                          # input shape [1, 1921, 384]  [3, 40x12, 784]
         q = input[:,0,:].unsqueeze(1)                                # cls_token 으로 쿼리 
         x = input[:,1:,:]
         B,N,C = x.shape
@@ -94,42 +94,85 @@ class VIT(nn.Module):
         q = self.to_q(q)                                            # B, 1, C
         q = q * 0.05103                                             # /sqrt(384)
         
-        num_indices = C // 8                                        # 96개의 패치
+        num_indices = N // 8                                        # 96개의 패치
         attn = q @ k.transpose(-2, -1)                              # B, 1, N
         random_indices = torch.randperm(N)
         row_indices = torch.arange(0, N-1)                          # partition을 가로 기준으로 
-        chunks = torch.chunk(random_indices, num_indices)           # N개의 수를 C//8개의 chunk로 나눔 row, random 중에
-        row_chunks = torch.chunk(row_indices, 80)
+        chunks = torch.chunk(random_indices, num_indices)           
+        row_chunks = torch.chunk(row_indices, 12)
+        
+        collist=[]
+        
+        for i in range (40):
+             for j in range(12):
+                collist.append(i+40*j)
+                
+        col_indices = torch.tensor(collist)
+        
+        col_chunks = torch.chunk(col_indices, 40)
+        
+        list=[]
+        for i in range(0, 467, 2):
+            if i not in list:
+                list.append(i)
+                list.append(i+1)
+                list.append(i+12)
+                list.append(i+13)
+        patch=torch.tensor(list)
+        patch_chunks=torch.chunk(patch, 120)
+        
         masked = torch.zeros(attn.shape).cuda()
         
-        if self.training:                                                              # training시에만 partition
-            for idx in row_chunks:
-                part = attn[:,:,idx].clone()
-                part = part.softmax(dim=-1)                                        # B, 1, num_indices
-                median = torch.median(part, dim=-1)[0].unsqueeze(-1).cuda()        # B, 1, 1   # softmax값들의 median  median말고 더 낮은 수 고려      
-                mask_index = (part > median).cuda()                                # B, 1, num_indices part > median -> part < median 고려
-                attn[:,:,idx] = part
-                mask = part.clone()
-                mask[mask_index] *= 0
-                masked[:,:,idx] = mask
-        else:
-            attn /= torch.max(attn)
-            
-        masked /= (num_indices/2)    ## ??
+        #attn /= 100                                                                    # temp scaling
+        
+        #if self.training:                                                              # training시에만 partition
+        for idx in patch_chunks:
+            part = attn[:,:,idx].clone()
+            part = part.softmax(dim=-1)                                        # B, 1, num_indices
+            median = torch.median(part, dim=-1)[0].unsqueeze(-1).cuda()        # B, 1, 1   # softmax값들의 median  median말고 더 낮은 수 고려      
+            mask_index = (part > median).cuda()                                # B, 1, num_indices part > median -> part < median 고려
+            attn[:,:,idx] = part
+            mask = part.clone()
+            mask[mask_index] *= 0
+            masked[:,:,idx] = mask
+        '''else:
+            #attn /= torch.max(attn)
+            attn = attn.softmax(dim=-1)'''
+        
+        
+        # Pose value를 비교하여 outlier 잡아내기
+        ########################################################################################################################
+        _, top_index = torch.topk(attn.view(B, -1), int(0.25 * self.patch_h * self.patch_w), dim=1, largest=True)
+
+        #top_value = torch.gather(v, dim=1, index=top_index.unsqueeze(-1).expand(-1, -1, C))
+        top_value = []
+        for i in range(B):
+            top_value.append(v[i,top_index[i],:].unsqueeze(0))
+
+        top_value = torch.cat(top_value).cuda()
+        #print(v.shape, top_value.shape, top_index.shape)
+        top_value = torch.mean(top_value, dim=1).unsqueeze(1).cuda()
+        #print(v.shape, top_value.shape)
+        similarity = F.cosine_similarity(top_value, v, dim=2).cuda()
+        #print(similarity.shape)
+        ########################################################################################################################
+        
         
         #training시에만 mask 적용
         if self.drop:
             x = masked @ v
         else:
             x = attn @ v
-            
+        
+        #x =  attn @ v
+        
         x = x.transpose(1, 2).reshape(B, 1, C)
         x = self.proj(x)
         x = self.encoder.norm(x)
         
-        
-        
-        return x, (attn.reshape(B,self.h//self.patch_size[1], self.w//self.patch_size[0]), masked.reshape(B,self.h//self.patch_size[1], self.w//self.patch_size[0]))  #pose_inputs, attn_map, masked_attn_map
+        return x, (attn.reshape(B,self.h//self.patch_size[1], self.w//self.patch_size[0]),
+                   masked.reshape(B,self.h//self.patch_size[1], self.w//self.patch_size[0])), similarity.reshape(B, self.h//self.patch_size[1], self.w//self.patch_size[0])
+        #pose_inputs, attn_map, masked_attn_map, pose similarity
         
         
     def _resize_pos_embed(self, pos_emb, gs_h, gs_w):
@@ -219,4 +262,3 @@ class VIT(nn.Module):
         
 
         return mask_min.detach(), masked_mask_min.detach()#, mask_mean.detach(), masked_mask_mean.detach(), correlation.detach(), entropy.detach()
-

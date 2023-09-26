@@ -205,7 +205,7 @@ class Trainer:
         if self.use_posenet:
             if self.pose_input == 'fusion':
                 self.models["pose_encoder"] = networks.VIT(input_size=(self.opt.height,self.opt.width), num_input_channels=7)
-                self.models["pose"] = networks.PoseDecoder(num_ch_enc=np.array([768]), num_input_features=1, num_frames_to_predict_for=2)
+                self.models["pose"] = networks.PoseDecoder(num_ch_enc=np.array([384]), num_input_features=1, num_frames_to_predict_for=2)
                 #self.models["pose_encoder"] = networks.ResnetEncoder(num_layers=18, pretrained=True, num_input_channels=8)
             elif self.pose_input == 'rgb':
                 self.models["pose_encoder"] = networks.VIT(input_size=(self.opt.height,self.opt.width), num_input_channels=3)
@@ -240,6 +240,7 @@ class Trainer:
             self.model_lr_scheduler.step()
         self.step = 0
         self.start_time = time.time()
+
         for self.epoch in range(self.opt.start_epoch, self.opt.num_epochs):
             self.Flow.num = 0
             self.Flow.mean = 0
@@ -381,7 +382,8 @@ class Trainer:
         elif self.pose_input == 'fusion':
             for f_i in self.opt.novel_frame_ids[1:]:
                 pose_inputs = torch.cat([preprocess_rgb(inputs["color_aug", 0, 0]), preprocess_disp(depth), preprocess_flow(inputs["flow", f_i, 0])], dim=1)
-                pose_inputs, attn_map = self.models["pose_encoder"](pose_inputs)
+                #pose_inputs, attn_map = self.models["pose_encoder"](pose_inputs)
+                pose_inputs, attn_map, similarity = self.models["pose_encoder"](pose_inputs) 
 
                 axisangle, translation = self.models["pose"](pose_inputs)
                 outputs[("axisangle", 0, f_i)] = axisangle
@@ -390,6 +392,8 @@ class Trainer:
                 attn_map, masked_attn_map = attn_map
                 outputs[("attn_min", 0, f_i)] = attn_map
                 outputs[("masked_attn_min", 0, f_i)] = masked_attn_map
+                
+                outputs[("similarity", 0, f_i)] = similarity  
 
                 # Invert the matrix if the frame id is negative
                 outputs[("cam_T_cam", 0, f_i)] = transformation_from_parameters(axisangle[:, 0], translation[:, 0], invert=(f_i < 0))
@@ -691,6 +695,9 @@ class Trainer:
                     writer.add_image("masked_attn_map_inverse_min_{}/{}".format(frame_id, self.epoch),
                              self.show_attn_on_image(inputs["color", 0, 0][j], outputs[("masked_attn_min", 0, frame_id)][j], inverse=True).transpose(2,0,1), val_idx+j)
                     writer.add_image("pure_attn_map_{}/{}".format(frame_id, self.epoch),normalize_image(outputs["attn_min", 0, frame_id][j].unsqueeze(0)), val_idx+j)
+                    
+                    writer.add_image("similarity_map_{}/{}".format(frame_id, self.epoch),
+                             self.show_attn_on_image(inputs["color", 0, 0][j], outputs[("similarity", 0, frame_id)][j]).transpose(2,0,1), val_idx+j)  ## hyonseo
 
                     
             writer.add_image("mask_or/{}".format(self.epoch), (((outputs[("mask", -1, 0)][j] + outputs[("mask", 1, 0)][j])) / 2) * inputs[("color", 0, 0)][j], val_idx+j)
@@ -908,7 +915,7 @@ class Trainer:
                     outputs = self.models['depth'](features)
                     _, depth = disp_to_depth(outputs[("disp", 0, 0)], self.opt.min_depth, self.opt.max_depth)
                     pose_inputs = torch.cat([preprocess_rgb(inputs["color_aug", 0, 0]), preprocess_depth(depth), preprocess_flow(inputs["flow", 1, 0])], dim=1)
-                    pose_inputs, attn_map = self.models["pose_encoder"](pose_inputs)
+                    pose_inputs, attn_map, similarity = self.models["pose_encoder"](pose_inputs)
                     axisangle, translation = self.models["pose"](pose_inputs)
                     
                 pred_poses.append(transformation_from_parameters(axisangle[:, 0], translation[:, 0]).cpu().numpy())
