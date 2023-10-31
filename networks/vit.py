@@ -42,6 +42,7 @@ class VIT(nn.Module):
         self.to_kv = nn.Linear(self.dim, self.dim * 2, bias = False)
         nn.init.xavier_uniform_(self.to_kv.weight)
         self.to_q = nn.Linear(self.dim, self.dim, bias = False)
+        self.to_qkv = nn.Linear(self.dim, self.dim * 3, bias = False)
         nn.init.xavier_uniform_(self.to_q.weight)
         
         self.proj = nn.Linear(self.dim, self.dim)
@@ -86,16 +87,19 @@ class VIT(nn.Module):
 
     def make_pose(self, input):
         #print(input.shape)                                          # input shape [1, 1921, 384]  [3, 40x12, 784]
-        q = input[:,0,:].unsqueeze(1)                                # cls_token 으로 쿼리 
+        #q = input[:,0,:].unsqueeze(1)                                # cls_token 으로 쿼리 
         x = input[:,1:,:]
         B,N,C = x.shape
-        kv = self.to_kv(x).reshape(B, N, 2, C).permute(2, 0, 1, 3)  # 2, B, N, C
-        k, v = kv.unbind(0)                                         # B, N, C
-        q = self.to_q(q)                                            # B, 1, C
+        #B, N, C = input.shape
+        #kv = self.to_kv(x).reshape(B, N, 2, C).permute(2, 0, 1, 3)  # 2, B, N, C
+        #k, v = kv.unbind(0)                                         # B, N, C
+        qkv = self.to_qkv(x).reshape(B, N, 3, C).permute(2, 0, 1, 3)
+        q, k, v = qkv.unbind(0)
         q = q * 0.05103                                             # /sqrt(384)
         
-        num_indices = N // 8                                        # 96개의 패치
-        attn = q @ k.transpose(-2, -1)                              # B, 1, N
+        num_indices = C // 8                                        # 96개의 패치
+        #attn = q @ k.transpose(-2, -1)                              # B, 1, N
+        attn = torch.einsum('bqc, bkc -> bqk', q, k)                 # B, N, N
         random_indices = torch.randperm(N)
         row_indices = torch.arange(0, N-1)                          # partition을 가로 기준으로 
         chunks = torch.chunk(random_indices, num_indices)           
@@ -123,56 +127,69 @@ class VIT(nn.Module):
         
         masked = torch.zeros(attn.shape).cuda()
         
-        #attn /= 100                                                                    # temp scaling
-        
-        #if self.training:                                                              # training시에만 partition
-        for idx in patch_chunks:
-            part = attn[:,:,idx].clone()
-            part = part.softmax(dim=-1)                                        # B, 1, num_indices
-            median = torch.median(part, dim=-1)[0].unsqueeze(-1).cuda()        # B, 1, 1   # softmax값들의 median  median말고 더 낮은 수 고려      
-            mask_index = (part > median).cuda()                                # B, 1, num_indices part > median -> part < median 고려
-            attn[:,:,idx] = part
-            mask = part.clone()
-            mask[mask_index] *= 0
-            masked[:,:,idx] = mask
-        '''else:
-            #attn /= torch.max(attn)
-            attn = attn.softmax(dim=-1)'''
+        attn /= 100                                                                    # temp scaling
         
         
+        if self.training:                                                              # training시에만 partition
+            for idx in col_chunks:
+                part = attn[:,:,idx].clone()
+                part = part.softmax(dim=-1)                                        # B, 1, num_indices
+                median = torch.median(part, dim=-1)[0].unsqueeze(-1).cuda()        # B, 1, 1   # softmax값들의 median  median말고 더 낮은 수 고려      
+                mask_index = (part > median).cuda()                                # B, 1, num_indices part > median -> part < median 고려
+                attn[:,:,idx] = part
+                mask = part.clone()
+                mask[mask_index] *= 0
+                masked[:,:,idx] = mask
+        else:
+            attn = attn.softmax(dim=-1)
+        
+        #attn = attn.softmax(dim=-1)
+            
+        masked /= (num_indices/2)    ## ??
+        '''
         # Pose value를 비교하여 outlier 잡아내기
         ########################################################################################################################
-        _, top_index = torch.topk(attn.view(B, -1), int(0.25 * self.patch_h * self.patch_w), dim=1, largest=True)
+        _, top_index = torch.topk(attn.view(B, -1), int(0.1 * self.patch_h * self.patch_w), dim=1, largest=True)
 
         #top_value = torch.gather(v, dim=1, index=top_index.unsqueeze(-1).expand(-1, -1, C))
         top_value = []
         for i in range(B):
-            top_value.append(v[i,top_index[i],:].unsqueeze(0))
+            top_value.append(k[i,top_index[i],:].unsqueeze(0))
 
         top_value = torch.cat(top_value).cuda()
         #print(v.shape, top_value.shape, top_index.shape)
         top_value = torch.mean(top_value, dim=1).unsqueeze(1).cuda()
         #print(v.shape, top_value.shape)
-        similarity = F.cosine_similarity(top_value, v, dim=2).cuda()
+        similarity = F.cosine_similarity(top_value, k, dim=2).cuda()
         #print(similarity.shape)
         ########################################################################################################################
-        
-        
+        '''
+        '''
         #training시에만 mask 적용
         if self.drop:
-            x = masked @ v
+            x = torch.einsum('bal, bcn -> bac', masked, v)
         else:
-            x = attn @ v
+            x = torch.einsum('bal, bnc -> bac', attn, v)  
+        '''
         
         #x =  attn @ v
+        x = torch.einsum('bal, bnc -> bac', attn, v)  # B, N, C
         
-        x = x.transpose(1, 2).reshape(B, 1, C)
+        #x = x.transpose(1, 2).reshape(B, 1, C)
         x = self.proj(x)
         x = self.encoder.norm(x)
-        
-        return x, (attn.reshape(B,self.h//self.patch_size[1], self.w//self.patch_size[0]),
-                   masked.reshape(B,self.h//self.patch_size[1], self.w//self.patch_size[0])), similarity.reshape(B, self.h//self.patch_size[1], self.w//self.patch_size[0])
-        #pose_inputs, attn_map, masked_attn_map, pose similarity
+        '''
+        q.reshape(B, self.h//self.patch_size[1], self.w//self.patch_size[0])
+        k.reshape(B, self.h//self.patch_size[1], self.w//self.patch_size[0])
+        v.reshape(B, self.h//self.patch_size[1], self.w//self.patch_size[0])
+        '''
+        attn = torch.mean(attn, dim=1)
+        masked = torch.mean(masked, dim=1)
+        x = torch.mean(x, dim=1)
+        #x = x[:,0,:]
+        return x, (attn.reshape(B,self.h//self.patch_size[1], self.w//self.patch_size[0]), masked.reshape(B,self.h//self.patch_size[1], self.w//self.patch_size[0])) 
+        #return x, (attn.reshape(B,self.h//self.patch_size[1], self.w//self.patch_size[0]), masked.reshape(B,self.h//self.patch_size[1], self.w//self.patch_size[0])), similarity.reshape(B, self.h//self.patch_size[1], self.w//self.patch_size[0])  
+        #pose_inputs, attn_map, masked_attn_map, pose_similarity
         
         
     def _resize_pos_embed(self, pos_emb, gs_h, gs_w):
@@ -262,3 +279,4 @@ class VIT(nn.Module):
         
 
         return mask_min.detach(), masked_mask_min.detach()#, mask_mean.detach(), masked_mask_mean.detach(), correlation.detach(), entropy.detach()
+
